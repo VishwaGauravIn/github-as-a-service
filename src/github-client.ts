@@ -164,13 +164,10 @@ export class GitHubClient {
   async putFile(path: string, content: string, message: string, sha?: string): Promise<string> {
     const start = Date.now();
 
-    // If no SHA provided, try to get it from cache or fetch it
+    // Use SHA from cache only — never pre-fetch just to get SHA.
+    // If file exists but SHA is wrong, retry logic handles the 409 conflict.
     if (!sha) {
       sha = this.cache.getSha(`file:${path}`) ?? undefined;
-      if (!sha) {
-        const existing = await this.getFile(path);
-        sha = existing?.sha;
-      }
     }
 
     const result = await this.withRetry(async () => {
@@ -199,10 +196,6 @@ export class GitHubClient {
 
     if (!sha) {
       sha = this.cache.getSha(`file:${path}`) ?? undefined;
-      if (!sha) {
-        const existing = await this.getBinaryFile(path);
-        sha = existing?.sha;
-      }
     }
 
     const result = await this.withRetry(async () => {
@@ -289,9 +282,17 @@ export class GitHubClient {
 
   /**
    * Create, update, or delete multiple files in a single commit.
-   * Creates/updates use Git Trees API for efficiency.
-   * Deletes use sequential deleteFile calls (Git Trees API doesn't reliably
-   * support deletion via sha:null with base_tree).
+   * Uses Git Trees API for ALL operations (including deletes) — never
+   * falls back to sequential calls to avoid API rate limit exhaustion.
+   *
+   * How it works:
+   * 1. Get current branch HEAD → commit → base tree
+   * 2. Fetch the full recursive tree
+   * 3. Build a new tree: keep everything NOT being deleted, add blobs for creates/updates
+   * 4. Create new tree (WITHOUT base_tree) → commit → update ref
+   *
+   * Total: ~4 + N_create API calls (N_create blob creations can be parallelized)
+   * Deletes are FREE (just excluded from the new tree).
    */
   async batchCommit(
     operations: BatchOperation[],
@@ -301,32 +302,43 @@ export class GitHubClient {
 
     const start = Date.now();
 
-    // Split operations: creates/updates go through Trees API, deletes go sequentially
-    const createUpdateOps = operations.filter((op) => op.type !== 'delete');
     const deleteOps = operations.filter((op) => op.type === 'delete');
+    const createUpdateOps = operations.filter((op) => op.type !== 'delete');
+    const deletePaths = new Set(deleteOps.map((op) => op.path));
 
-    // Handle creates/updates via Git Trees API (single commit, efficient)
+    // 1. Get the latest commit SHA for the branch
+    const { data: refData } = await this.octokit.git.getRef({
+      owner: this.config.owner,
+      repo: this.config.repo,
+      ref: `heads/${this.config.branch}`,
+    });
+    const latestCommitSha = refData.object.sha;
+
+    // 2. Fetch the full recursive tree
+    const { data: fullTree } = await this.octokit.git.getTree({
+      owner: this.config.owner,
+      repo: this.config.repo,
+      tree_sha: latestCommitSha,
+      recursive: 'true',
+    });
+
+    // 3. Build new tree entries:
+    //    - Keep everything from the current tree EXCEPT files being deleted
+    //    - Add new blobs for creates/updates
+    const existingEntries = fullTree.tree
+      .filter((entry) => !deletePaths.has(entry.path || ''))
+      .filter((entry) => entry.type === 'blob' || entry.type === 'tree')
+      .map((entry) => ({
+        path: entry.path!,
+        mode: entry.mode as '100644' | '100755' | '040000' | '160000' | '120000',
+        type: entry.type as 'blob' | 'tree',
+        sha: entry.sha!,
+      }));
+
+    // Create blobs for new/updated files (parallelized)
+    let newEntries: { path: string; mode: string; type: string; sha: string }[] = [];
     if (createUpdateOps.length > 0) {
-      // 1. Get the latest commit SHA for the branch
-      const { data: refData } = await this.octokit.git.getRef({
-        owner: this.config.owner,
-        repo: this.config.repo,
-        ref: `heads/${this.config.branch}`,
-      });
-      const latestCommitSha = refData.object.sha;
-
-      // 2. Get the tree SHA from that commit
-      const { data: commitData } = await this.octokit.git.getCommit({
-        owner: this.config.owner,
-        repo: this.config.repo,
-        commit_sha: latestCommitSha,
-      });
-      const baseTreeSha = commitData.tree.sha;
-
-      // 3. Build tree entries (creates/updates only)
-      const treeEntries: TreeEntry[] = [];
-
-      for (const op of createUpdateOps) {
+      const blobPromises = createUpdateOps.map(async (op) => {
         const { data: blob } = await this.octokit.git.createBlob({
           owner: this.config.owner,
           repo: this.config.repo,
@@ -335,67 +347,122 @@ export class GitHubClient {
             : Buffer.from(op.content as string).toString('base64'),
           encoding: 'base64',
         });
-        treeEntries.push({
+        return {
           path: op.path,
-          mode: '100644',
-          type: 'blob',
+          mode: '100644' as const,
+          type: 'blob' as const,
           sha: blob.sha,
-        });
-      }
-
-      // 4. Create a new tree
-      const { data: newTree } = await this.octokit.git.createTree({
-        owner: this.config.owner,
-        repo: this.config.repo,
-        base_tree: baseTreeSha,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        tree: treeEntries as any,
+        };
       });
-
-      // 5. Create a commit pointing to the new tree
-      const { data: newCommit } = await this.octokit.git.createCommit({
-        owner: this.config.owner,
-        repo: this.config.repo,
-        message,
-        tree: newTree.sha,
-        parents: [latestCommitSha],
-      });
-
-      // 6. Update the branch reference
-      await this.octokit.git.updateRef({
-        owner: this.config.owner,
-        repo: this.config.repo,
-        ref: `heads/${this.config.branch}`,
-        sha: newCommit.sha,
-      });
+      newEntries = await Promise.all(blobPromises);
     }
 
-    // Handle deletes sequentially (reliable, avoids GitRPC::BadObjectState)
-    if (deleteOps.length > 0) {
-      for (const op of deleteOps) {
-        try {
-          await this.deleteFile(op.path, message);
-        } catch (err: unknown) {
-          // Skip files that are already deleted (stale cache)
-          const error = err as { code?: string };
-          if (error instanceof NotFoundError || error.code === 'NOT_FOUND') {
-            this.logger.info(`Skipping already-deleted file: ${op.path}`);
-            continue;
-          }
-          throw err;
-        }
-      }
-    }
+    // Merge: existing (minus deletions) + new/updated entries
+    // If a file is being updated, the new entry overwrites the existing one
+    const updatePaths = new Set(newEntries.map((e) => e.path));
+    const mergedEntries = [
+      ...existingEntries.filter((e) => !updatePaths.has(e.path)),
+      ...newEntries,
+    ];
+
+    // 4. Create a new tree (NO base_tree — we're providing the complete tree)
+    const { data: newTree } = await this.octokit.git.createTree({
+      owner: this.config.owner,
+      repo: this.config.repo,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      tree: mergedEntries as any,
+    });
+
+    // 5. Create a commit pointing to the new tree
+    const { data: newCommit } = await this.octokit.git.createCommit({
+      owner: this.config.owner,
+      repo: this.config.repo,
+      message,
+      tree: newTree.sha,
+      parents: [latestCommitSha],
+    });
+
+    // 6. Update the branch reference
+    await this.octokit.git.updateRef({
+      owner: this.config.owner,
+      repo: this.config.repo,
+      ref: `heads/${this.config.branch}`,
+      sha: newCommit.sha,
+    });
 
     // Invalidate all affected cache entries
     for (const op of operations) {
       this.cache.invalidate(`file:${op.path}`);
-      // Invalidate parent directory cache
       const dirPath = op.path.split('/').slice(0, -1).join('/');
       if (dirPath) this.cache.invalidate(`dir:${dirPath}`);
     }
 
-    this.logger.api('BATCH', `${operations.length} files`, `${createUpdateOps.length} writes, ${deleteOps.length} deletes`, Date.now() - start);
+    this.logger.api(
+      'BATCH',
+      `${operations.length} files`,
+      `${createUpdateOps.length} writes, ${deleteOps.length} deletes, commit: ${newCommit.sha.slice(0, 7)}`,
+      Date.now() - start
+    );
+  }
+
+  /**
+   * Fetch all files in a directory using the recursive tree API.
+   * Returns file paths and their blob SHAs — much cheaper than
+   * fetching each file individually.
+   *
+   * This addresses the N+1 problem: instead of 1 listDir + N getFile calls,
+   * we make 1 getTree call + only fetch blobs for uncached files.
+   */
+  async getTreeContents(
+    dirPath: string
+  ): Promise<{ path: string; sha: string }[]> {
+    const start = Date.now();
+
+    // Get the branch HEAD
+    const { data: refData } = await this.octokit.git.getRef({
+      owner: this.config.owner,
+      repo: this.config.repo,
+      ref: `heads/${this.config.branch}`,
+    });
+
+    // Get the full recursive tree
+    const { data: fullTree } = await this.octokit.git.getTree({
+      owner: this.config.owner,
+      repo: this.config.repo,
+      tree_sha: refData.object.sha,
+      recursive: 'true',
+    });
+
+    // Filter to only blobs under the target directory
+    const entries = fullTree.tree
+      .filter(
+        (entry) =>
+          entry.type === 'blob' &&
+          entry.path?.startsWith(dirPath + '/') &&
+          entry.path.endsWith('.json') &&
+          !entry.path.split('/').pop()?.startsWith('_')
+      )
+      .map((entry) => ({
+        path: entry.path!,
+        sha: entry.sha!,
+      }));
+
+    this.logger.api('TREE', dirPath, `${entries.length} blobs`, Date.now() - start);
+    return entries;
+  }
+
+  /**
+   * Fetch a blob's content by SHA.
+   * This is used alongside getTreeContents to efficiently fetch
+   * file contents without the overhead of getContent API.
+   */
+  async getBlob(sha: string): Promise<string> {
+    const { data } = await this.octokit.git.getBlob({
+      owner: this.config.owner,
+      repo: this.config.repo,
+      file_sha: sha,
+    });
+    return Buffer.from(data.content, 'base64').toString('utf-8');
   }
 
   // ─── Rate Limit ─────────────────────────────────────────────────────────
@@ -430,7 +497,12 @@ export class GitHubClient {
         lastError = err;
         const error = err as { status?: number; response?: { headers?: Record<string, string>; data?: { message?: string } } };
 
-        // Rate limit — wait and retry
+        // Network error — throw immediately, never retry (avoids API flood)
+        if (this.isNetworkError(err)) {
+          throw this.wrapError(err);
+        }
+
+        // Rate limit — throw immediately with retry info
         if (error.status === 403 && error.response?.headers?.['x-ratelimit-remaining'] === '0') {
           const resetTime = error.response.headers['x-ratelimit-reset'];
           const resetsAt = new Date(Number(resetTime) * 1000);
@@ -456,7 +528,7 @@ export class GitHubClient {
           throw new AuthenticationError();
         }
 
-        // Other errors — retry with backoff
+        // Other API errors — retry with backoff
         if (attempt < attempts - 1) {
           this.logger.warn(`Request failed (attempt ${attempt + 1}/${attempts}), retrying...`);
           await this.delay(this.getBackoffDelay(attempt, backoff, baseDelay));
@@ -484,6 +556,35 @@ export class GitHubClient {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  // ─── Error Classification ──────────────────────────────────────────────
+
+  /**
+   * Detect network-level errors (no HTTP response received).
+   * These should never trigger fallback/retry loops to avoid API floods.
+   */
+  private isNetworkError(err: unknown): boolean {
+    const error = err as { code?: string; type?: string; message?: string; status?: number };
+
+    // If we got an HTTP status code, it's NOT a network error — it's an API error
+    if (error.status) return false;
+
+    // Node.js network error codes
+    const networkCodes = new Set([
+      'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT',
+      'ENETUNREACH', 'ENOTFOUND', 'EPIPE', 'EAI_AGAIN',
+      'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
+    ]);
+
+    if (error.code && networkCodes.has(error.code)) return true;
+
+    // Fetch API errors
+    if (error.type === 'system' || error.type === 'aborted') return true;
+    if (error.message?.includes('fetch failed')) return true;
+    if (error.message?.includes('network')) return true;
+
+    return false;
+  }
+
   // ─── Error Wrapping ─────────────────────────────────────────────────────
 
   private wrapError(err: unknown): GaaSError {
@@ -494,7 +595,6 @@ export class GitHubClient {
     return new GitHubApiError(String(err), 500);
   }
 }
-
 
 
 export interface BatchOperation {
@@ -510,3 +610,4 @@ interface TreeEntry {
   type: 'blob';
   sha: string | null;
 }
+
