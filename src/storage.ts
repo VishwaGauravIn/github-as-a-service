@@ -117,11 +117,19 @@ export class Storage {
 
   /**
    * Check if a file exists in storage.
+   * Uses directory listing (cheap) instead of downloading the full file.
    */
   async exists(storagePath: string): Promise<boolean> {
     const fullPath = `${STORAGE_PREFIX}/${storagePath}`;
-    const file = await this.github.getBinaryFile(fullPath);
-    return file !== null;
+    const parentDir = fullPath.split('/').slice(0, -1).join('/');
+    const fileName = fullPath.split('/').pop();
+
+    try {
+      const entries = await this.github.listDirectory(parentDir);
+      return entries.some((e) => e.name === fileName);
+    } catch {
+      return false;
+    }
   }
 
   /**
