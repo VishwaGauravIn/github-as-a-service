@@ -10,6 +10,9 @@ GaaS is an NPM package that turns any GitHub private (or public) repository into
 
 **Zero cost. Zero infrastructure. Your data, your repo.**
 
+<img width="1536" height="1024" alt="gaas-thumb" src="https://github.com/user-attachments/assets/a8aacbeb-75a0-4a5e-9ad0-c167460c2b3f" />
+
+
 ---
 
 ## Quick Start
