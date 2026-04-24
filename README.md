@@ -2,7 +2,7 @@
 
 > Turn any GitHub repository into a zero-cost, version-controlled database.
 
-[![npm](https://img.shields.io/npm/v/gaas)](https://www.npmjs.com/package/gaas)
+[![npm](https://img.shields.io/npm/v/github-as-a-service)](https://www.npmjs.com/package/github-as-a-service)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
 
@@ -478,6 +478,29 @@ my-app-data/
     └── docs/
         └── report.pdf
 ```
+
+---
+
+## API Rate Limit Optimization
+
+GaaS aggressively minimizes GitHub API usage under the hood:
+
+| Operation | API Calls |
+|---|---|
+| `create()` / `update()` | 1 |
+| `findById()` | 1 (0 if cached) |
+| `findAll()` (50 records) | 2 + uncached records (2 if all cached) |
+| `createMany(10)` | ~14 (parallelized blob creation) |
+| `deleteMany(50)` | 4 (tree reconstruction) |
+| `clear()` (100 records) | 6 (tree reconstruction) |
+| `storage.exists()` | 1 (dir listing, not file download) |
+
+**How it works:**
+- **Batch operations** use the Git Trees API to create/update/delete any number of files in a **single commit**
+- **Deletes are free** — the tree is rebuilt without deleted paths (no per-file API calls)
+- **Reads use recursive tree** — fetch all file metadata in 1 call, then only fetch content for uncached files
+- **In-memory cache** with TTL tracks file content + SHA to avoid redundant reads
+- **Network errors throw immediately** — never triggers retry/fallback floods that exhaust rate limits
 
 ---
 
