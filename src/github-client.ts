@@ -289,7 +289,9 @@ export class GitHubClient {
 
   /**
    * Create, update, or delete multiple files in a single commit.
-   * This uses the low-level Git Trees API to stay efficient on rate limits.
+   * Creates/updates use Git Trees API for efficiency.
+   * Deletes use sequential deleteFile calls (Git Trees API doesn't reliably
+   * support deletion via sha:null with base_tree).
    */
   async batchCommit(
     operations: BatchOperation[],
@@ -299,35 +301,32 @@ export class GitHubClient {
 
     const start = Date.now();
 
-    // 1. Get the latest commit SHA for the branch
-    const { data: refData } = await this.octokit.git.getRef({
-      owner: this.config.owner,
-      repo: this.config.repo,
-      ref: `heads/${this.config.branch}`,
-    });
-    const latestCommitSha = refData.object.sha;
+    // Split operations: creates/updates go through Trees API, deletes go sequentially
+    const createUpdateOps = operations.filter((op) => op.type !== 'delete');
+    const deleteOps = operations.filter((op) => op.type === 'delete');
 
-    // 2. Get the tree SHA from that commit
-    const { data: commitData } = await this.octokit.git.getCommit({
-      owner: this.config.owner,
-      repo: this.config.repo,
-      commit_sha: latestCommitSha,
-    });
-    const baseTreeSha = commitData.tree.sha;
+    // Handle creates/updates via Git Trees API (single commit, efficient)
+    if (createUpdateOps.length > 0) {
+      // 1. Get the latest commit SHA for the branch
+      const { data: refData } = await this.octokit.git.getRef({
+        owner: this.config.owner,
+        repo: this.config.repo,
+        ref: `heads/${this.config.branch}`,
+      });
+      const latestCommitSha = refData.object.sha;
 
-    // 3. Build tree entries
-    const treeEntries: TreeEntry[] = [];
+      // 2. Get the tree SHA from that commit
+      const { data: commitData } = await this.octokit.git.getCommit({
+        owner: this.config.owner,
+        repo: this.config.repo,
+        commit_sha: latestCommitSha,
+      });
+      const baseTreeSha = commitData.tree.sha;
 
-    for (const op of operations) {
-      if (op.type === 'delete') {
-        treeEntries.push({
-          path: op.path,
-          mode: '100644',
-          type: 'blob',
-          sha: null, // null SHA = delete
-        });
-      } else {
-        // Create a blob for each file
+      // 3. Build tree entries (creates/updates only)
+      const treeEntries: TreeEntry[] = [];
+
+      for (const op of createUpdateOps) {
         const { data: blob } = await this.octokit.git.createBlob({
           owner: this.config.owner,
           repo: this.config.repo,
@@ -343,33 +342,50 @@ export class GitHubClient {
           sha: blob.sha,
         });
       }
+
+      // 4. Create a new tree
+      const { data: newTree } = await this.octokit.git.createTree({
+        owner: this.config.owner,
+        repo: this.config.repo,
+        base_tree: baseTreeSha,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        tree: treeEntries as any,
+      });
+
+      // 5. Create a commit pointing to the new tree
+      const { data: newCommit } = await this.octokit.git.createCommit({
+        owner: this.config.owner,
+        repo: this.config.repo,
+        message,
+        tree: newTree.sha,
+        parents: [latestCommitSha],
+      });
+
+      // 6. Update the branch reference
+      await this.octokit.git.updateRef({
+        owner: this.config.owner,
+        repo: this.config.repo,
+        ref: `heads/${this.config.branch}`,
+        sha: newCommit.sha,
+      });
     }
 
-    // 4. Create a new tree
-    const { data: newTree } = await this.octokit.git.createTree({
-      owner: this.config.owner,
-      repo: this.config.repo,
-      base_tree: baseTreeSha,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      tree: treeEntries as any,
-    });
-
-    // 5. Create a commit pointing to the new tree
-    const { data: newCommit } = await this.octokit.git.createCommit({
-      owner: this.config.owner,
-      repo: this.config.repo,
-      message,
-      tree: newTree.sha,
-      parents: [latestCommitSha],
-    });
-
-    // 6. Update the branch reference
-    await this.octokit.git.updateRef({
-      owner: this.config.owner,
-      repo: this.config.repo,
-      ref: `heads/${this.config.branch}`,
-      sha: newCommit.sha,
-    });
+    // Handle deletes sequentially (reliable, avoids GitRPC::BadObjectState)
+    if (deleteOps.length > 0) {
+      for (const op of deleteOps) {
+        try {
+          await this.deleteFile(op.path, message);
+        } catch (err: unknown) {
+          // Skip files that are already deleted (stale cache)
+          const error = err as { code?: string };
+          if (error instanceof NotFoundError || error.code === 'NOT_FOUND') {
+            this.logger.info(`Skipping already-deleted file: ${op.path}`);
+            continue;
+          }
+          throw err;
+        }
+      }
+    }
 
     // Invalidate all affected cache entries
     for (const op of operations) {
@@ -379,7 +395,7 @@ export class GitHubClient {
       if (dirPath) this.cache.invalidate(`dir:${dirPath}`);
     }
 
-    this.logger.api('BATCH', `${operations.length} files`, `commit: ${newCommit.sha.slice(0, 7)}`, Date.now() - start);
+    this.logger.api('BATCH', `${operations.length} files`, `${createUpdateOps.length} writes, ${deleteOps.length} deletes`, Date.now() - start);
   }
 
   // ─── Rate Limit ─────────────────────────────────────────────────────────

@@ -358,6 +358,10 @@ export class Collection<T extends Record<string, unknown> = Record<string, unkno
 
   /** Delete all records in the collection. */
   async clear(): Promise<void> {
+    // Invalidate cache first to get fresh directory listing
+    this.cache.invalidatePrefix(`dir:${this.basePath}`);
+    this.cache.invalidatePrefix(`file:${this.basePath}`);
+
     const entries = await this.github.listDirectory(this.basePath);
     const files = entries.filter((e) => e.type === 'file' && e.name.endsWith('.json'));
 
