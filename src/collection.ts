@@ -174,19 +174,30 @@ export class Collection<T extends Record<string, unknown> = Record<string, unkno
 
   /** Get all records in the collection. */
   async findAll(): Promise<T[]> {
-    const entries = await this.github.listDirectory(this.basePath);
-    const files = entries.filter((e) => e.type === 'file' && e.name.endsWith('.json') && !e.name.startsWith('_'));
+    // Use recursive tree API to avoid N+1 problem
+    // Instead of: 1 listDir + N getFile = N+1 calls
+    // Now:        1 getTree  + N_uncached getBlob calls (cached = 0 calls)
+    const treeEntries = await this.github.getTreeContents(this.basePath);
 
     const records: T[] = [];
-    for (const file of files) {
-      const data = await this.github.getFile(file.path);
-      if (data) {
-        let content = data.content;
-        if (this.encryption) {
-          content = this.encryption.decrypt(content);
-        }
-        records.push(JSON.parse(content) as T);
+    for (const entry of treeEntries) {
+      const cacheKey = `file:${entry.path}`;
+      const cached = this.cache.get<string>(cacheKey);
+
+      let content: string;
+      if (cached && cached.fresh) {
+        content = cached.data;
+        this.logger.cache('HIT', cacheKey);
+      } else {
+        content = await this.github.getBlob(entry.sha);
+        this.cache.set(cacheKey, content, entry.sha);
+        this.logger.cache('SET', cacheKey);
       }
+
+      if (this.encryption) {
+        content = this.encryption.decrypt(content);
+      }
+      records.push(JSON.parse(content) as T);
     }
 
     return records;
@@ -358,25 +369,27 @@ export class Collection<T extends Record<string, unknown> = Record<string, unkno
 
   /** Delete all records in the collection. */
   async clear(): Promise<void> {
-    // Invalidate cache first to get fresh directory listing
+    // Invalidate cache to get fresh data
     this.cache.invalidatePrefix(`dir:${this.basePath}`);
     this.cache.invalidatePrefix(`file:${this.basePath}`);
 
-    const entries = await this.github.listDirectory(this.basePath);
-    const files = entries.filter((e) => e.type === 'file' && e.name.endsWith('.json'));
+    // Use tree API to list files (avoids stale cache issues)
+    const treeEntries = await this.github.getTreeContents(this.basePath);
 
-    if (files.length === 0) return;
+    if (treeEntries.length === 0) return;
 
-    const operations: BatchOperation[] = files.map((f) => ({
+    const operations: BatchOperation[] = treeEntries.map((entry) => ({
       type: 'delete' as const,
-      path: f.path,
+      path: entry.path,
       content: '',
     }));
 
+    // Tree reconstruction: all deletes handled in a single commit (~4 API calls)
     await this.github.batchCommit(operations, `[gaas] clear collection ${this.name}`);
     this.cache.invalidatePrefix(`file:${this.basePath}`);
     this.cache.invalidatePrefix(`dir:${this.basePath}`);
 
-    this.logger.info(`Cleared collection ${this.name} (${files.length} records)`);
+    this.logger.info(`Cleared collection ${this.name} (${treeEntries.length} records)`);
   }
 }
+
